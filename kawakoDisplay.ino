@@ -1,6 +1,9 @@
 #include <Adafruit_NeoMatrix.h>
 #include <LiquidCrystal_I2C.h>
 #include <Ethernet.h>
+#include "utils.h"
+#include "kawako.h"
+
 
 namespace Kawako {
     const unsigned char ledPinNumber = 3;
@@ -11,258 +14,399 @@ namespace Kawako {
         NEO_GRB            + NEO_KHZ800);
 
 
-    struct Color {
-        unsigned char r, g, b;
-
-        Color(byte r, byte g, byte b) {
-            this->r = r;
-            this->g = g;
-            this->b = b;
-        }
-
-        Color() {
-            this->r = 0;
-            this->g = 0;
-            this->b = 0;
-        }
-    };
-
     byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
 
     EthernetServer server(80);  // create a server listening on port 80
+    LiquidCrystal_I2C lcd(0x3f,16,2);
 }
 
+
+#ifdef TEST_ON_LAPTOP
+    #include <iostream>
+    using namespace std;
+    #define F(arg) arg
+#else
+    #define NULL 0
+    #include <string.h>
+    #include <avr/pgmspace.h>
+#endif
+
+
+#include <stdio.h>
+void urldecode(char *str) // inplace urldecode from https://gist.github.com/MightyPork/a3d1a2bae8fbbbc79e5e
+{
+    unsigned int x;
+
+    for (int i = 0; str[i] != 0; i++) {
+        char c = str[i];
+        if (c == '+') {
+            str[i] = ' ';
+        } else if (c == '%') {
+            // decode the byte
+            sscanf(&str[i + 1], "%02x", &x);
+            str[i] = x;
+
+            // shift following chars
+            for (int a = i + 3, b = i + 1;; a++, b++) {
+                str[b] = str[a]; // move
+                if (str[a] == 0) break;
+            }
+        }
+    }
+}
+
+// Returns true if receivedTheWholeRequest
+bool parseRequest(const char c, char* &text_c_str, CRGB &color, bool &userProvidedData, unsigned char &requestType) {
+    // static const int maxlength = 2000;
+    static const int maxlength = 100;
+    static char HTTP_req[maxlength];
+    static int currentIndex = 0;
+    static bool currentLineIsBlank = true;
+    static bool receivedTheWholeRequest = false;
+    static bool receivedTheFirstLine = false;
+    static bool url_encoder_rfc_tables_initialized = false;
+
+    if (!receivedTheFirstLine && currentIndex < maxlength-1) {
+        HTTP_req[currentIndex] = c;
+        HTTP_req[currentIndex+1] = '\0';
+        currentIndex++;
+    }
+
+    if (c == '\n' && HTTP_req[currentIndex-1] == '\r') { // end of the first line // TODO: fix: always false
+        receivedTheFirstLine = true;
+        DSERIALln("Received the first line:");
+        DSERIALln(HTTP_req);
+    }
+
+    if (c == '\n' && currentLineIsBlank) {
+        receivedTheWholeRequest = true;
+        DSERIALln("Received the whole request:");
+        DSERIALln(HTTP_req);
+    }
+
+    // if the request has been completely received
+    // if (c == '\n' && currentLineIsBlank) {
+    if (receivedTheWholeRequest) {
+        DSERIALln("Received the whole request");
+        DSERIALln(strlen(HTTP_req));
+        receivedTheWholeRequest = true;
+        if (currentIndex < maxlength) {
+            HTTP_req[currentIndex] = '\0';
+            currentIndex++;
+        }
+        char *result = NULL;
+        if ((result = strstr(HTTP_req, "favicon")) != NULL) {
+            requestType = REQUESTED_FAVICON;
+        } else if ((result = strstr(HTTP_req, "/?COLR=%23")) != NULL) {
+            requestType = REQUESTED_GET;
+
+            size_t colorStartIndex = result - HTTP_req + 10; // 10 characters in /?COLR=%23
+            size_t colorEndIndex = 0;
+            size_t textStartIndex = 0;
+            size_t textEndIndex = 0;
+            if ((result = strstr(HTTP_req, "&TEXT=")) != NULL) {
+                textStartIndex = result - HTTP_req + 6; // 6 characters in &TEXT=
+                colorEndIndex = result - HTTP_req;
+
+                if ((result = strstr(HTTP_req, " HTTP/1.1\r\n")) != NULL) {
+                    textEndIndex = result - HTTP_req;
+
+                    // copy text in given buffer
+                    // char * strncpy ( char * destination, const char * source, size_t num );
+                    const size_t textLength = textEndIndex - textStartIndex;
+                    if (text_c_str != NULL) {
+                        delete[] text_c_str;
+                    }
+                    text_c_str = new char[textLength + 1];
+                    strncpy(text_c_str, HTTP_req+textStartIndex, textLength);
+                    text_c_str[textLength] = '\0';
+                    urldecode(text_c_str);
+
+                    // parse color
+                    // colorHexadecimal ="#" + (HTTP_req.substring(currentIndex,nextIndex)).substring(3);
+                    //             color = Kawako::CRGB(
+                    //                 (unhex(colorHexadecimal[1]) << 4) + unhex(colorHexadecimal[2]),
+                    //                 (unhex(colorHexadecimal[3]) << 4) + unhex(colorHexadecimal[4]),
+                    //                 (unhex(colorHexadecimal[5]) << 4) + unhex(colorHexadecimal[6])
+                    //             );
+                    if (!url_encoder_rfc_tables_initialized) {
+                        url_encoder_rfc_tables_init(); // required to use unhex
+                    }
+                    color.r = (unhex(HTTP_req[colorStartIndex]) << 4) + unhex(HTTP_req[colorStartIndex+1]);
+                    color.g = (unhex(HTTP_req[colorStartIndex+2]) << 4) + unhex(HTTP_req[colorStartIndex+3]);
+                    color.b = (unhex(HTTP_req[colorStartIndex+4]) << 4) + unhex(HTTP_req[colorStartIndex+5]);
+
+                    userProvidedData = true;
+                } else {
+                    requestType = REQUESTED_ERROR_MISSING_END_TEXT;
+                }
+            } else {
+                requestType = REQUESTED_ERROR_MISSING_TEXT;
+            }
+        } else {
+            requestType = REQUESTED_SLASH;
+        }
+    }
+
+     // every line of text received from the client ends with \r\n
+    if (c == '\n') {
+        // last character on line of received text
+        // starting new line with next character read
+        currentLineIsBlank = true;
+    } else if (c != '\r') {
+        // a text character was received from client
+        currentLineIsBlank = false;
+    }
+
+    if (receivedTheWholeRequest) {
+        receivedTheWholeRequest = false;
+        receivedTheFirstLine = false;
+        currentIndex = 0;
+        currentLineIsBlank = true;
+        return true;
+    } else {
+        return false;
+    }
+}
+
+
+void setup();
+void loop();
+bool checkNewTextHTTP(String &text, CRGB &color);
+bool checkNewTextSerial(String &text, CRGB &color);
+bool displayOnLEDs(const String &newText, const bool &startAnew, const CRGB &color);
+
 void setup() {
-    Serial.begin(9600);
+    #ifdef SERIAL_USB
+        Serial.begin(9600);
+    #endif
     Kawako::leds.begin();
 
     Ethernet.begin(Kawako::mac);
     Kawako::server.begin(); // start to listen for clients
+
+
+    Kawako::lcd.init();                      // initialize the lcd
+    Kawako::lcd.backlight();
+    Kawako::lcd.setCursor(0,0);
+    Kawako::lcd.print(F("Change text: web"));
+    Kawako::lcd.setCursor(2,1);
+    Kawako::lcd.print(Ethernet.localIP());
 }
 
 void loop() {
-    static String currentText = "Welcome to Kawako";
+    static String currentText = String(F("WTP 2017"));
     // static String currentText = "Welcome to Kawako and welcome to the festival and try to make the board crash. Or doesn't it matter, that the message is so long? Nice :)";
-    static Kawako::Color currentColor(255, 255, 255);
-    // Serial.println(Ethernet.localIP());
+    static CRGB currentColor(0, 250, 243);
+    static bool initialMessage = true;
+    // DSERIALln(Ethernet.localIP());
 
-    // Text reception:
-    // mock reception:
-    // bool textChanged = false;
-    // serial reception:
-    // bool textChanged = checkNewTextSerial(currentText, currentColor);
-    // HTTP reception:
-    bool textChanged = checkNewTextHTTP(currentText, currentColor);
+    bool textChanged = false;
+    DSERIALln("------------");
+    if (!initialMessage) {
+        // Text reception:
+        // mock reception:
+        // textChanged = false;
+        // serial reception:
+        // with bool textChanged... : works great
+        // without bool textChanged... : works great as well
+        // textChanged = checkNewTextSerial(currentText, currentColor); DSERIALln("Ended checkNewTextSerial");
+        // fake HTTP:
+        // String test12345 = "";
+        // CRGB trucColor = CRGB(10, 120, 200);
+        // bool truc123 = checkNewTextSerial(test12345, trucColor); DSERIALln("Ended checkNewTextSerial");
+        // HTTP reception:
+        textChanged = checkNewTextHTTP(currentText, currentColor); DSERIALln("Ended checkNewTextHTTP");
 
-    if (textChanged) {
-        Serial.print("Received text: ");
-        Serial.println(currentText);
+        // DSERIAL("textChanged: "); DSERIALln(textChanged? "true" : "false");
+        // DSERIAL("currentText "); DSERIALln(currentText);
     }
 
+    DSERIAL("initialMessage: "); DSERIALln(initialMessage ? "true" : "false");
+    DSERIAL("textChanged: "); DSERIALln(textChanged ? "true" : "false");
+    DSERIAL("currentText: "); DSERIALln(currentText);
+    DSERIAL("currentColor: "); DSERIAL(currentColor.r); DSERIAL(" "); DSERIAL(currentColor.g); DSERIAL(" "); DSERIALln(currentColor.b);
+
+    if (textChanged || initialMessage) {
+        DSERIAL("Received text: ");
+        DSERIALln(currentText);
+        // currentText = "trick";
+
+        // String newText = String("new");
+        // for (int i = 0; i < currentText.length(); ++i) {
+        //     char c = currentText[i];
+        //     if (c == '\n' || c == '\r') {
+        //         c = ' ';
+        //     }
+        //     newText += currentText[i];
+        // }
+        // // newText += '\n'; // TRICK ?
+        // newText += '\0'; // TRICK ?
+        // currentText = "";
+        // currentText = newText;
+
+        DSERIAL("New Received text: ");
+        DSERIALln(currentText);
+    }
+    // else {
+    // }
+
     // display text
-    displayOnLEDs(currentText, textChanged, currentColor);
+    displayOnLEDs(currentText, textChanged || initialMessage, currentColor);
 
     // Control loop length
-    // delay(100); // TODO: check the duration of the loop
+    // delay(500); // TODO: check the duration of the loop
+
+    initialMessage = false;
 }
 
-bool checkNewTextHTTP(String &text,
-                      Kawako::Color &color) {
-    static String HTTP_req = ""; // stores the HTTP request
+bool checkNewTextHTTP(String &text, CRGB &color) {
+    // static String HTTP_req = String(""); // stores the HTTP request
     bool userProvidedData = false;
 
     EthernetClient client = Kawako::server.available(); // try to get a client
     if (client) {
-        Serial.println("Client connected");
-        bool currentLineIsBlank = true;
+        DSERIALln("Client connected");
+        // bool currentLineIsBlank = true;
         while (client.connected()) {
             if (client.available()) { // if data from the client is available
-                // Serial.println("data available from client");
+                // DSERIALln("data available from client");
                 char c = client.read();
-                HTTP_req += c;
-
-                // if the request has been completely received
-                if (c == '\n' && currentLineIsBlank) {
-                    unsigned int currentIndex=0;
-                    unsigned int nextIndex=HTTP_req.length();
-                    String colorHexadecimal = "#AABBCC";
-
-                    Serial.println("client is done with his request");
-                    Serial.println(HTTP_req);
-
-                    // check that the browser is asking for the page, or for favicon.ico
-                    // Serial.println("-----------Checking icon:");
-
-                    // Serial.print("indexOf favicon: ");
-                    // Serial.println(HTTP_req.indexOf("favicon"));
-                    // Serial.print("lastIndexOf of favicon: ");
-                    // Serial.println(HTTP_req.lastIndexOf("favicon"));
-
-                    // Serial.print("indexOf /favicon.ico: ");
-                    // Serial.println(HTTP_req.indexOf("favicon"));
-                    // Serial.print("indexOf /favicon.ico: ");
-                    // Serial.println(HTTP_req.indexOf("/favicon.ico"));
-                    // Serial.print("lastIndexOf of /favicon.ico: ");
-
-                    // HTTP_req = " coucou he sui la";
-                    // Serial.print("Changing HTTP_req to: ");
-                    // Serial.println(HTTP_req);
-
-                    // Serial.print("indexOf favicon: ");
-                    // Serial.println(HTTP_req.indexOf("favicon"));
-                    // Serial.print("lastIndexOf of favicon: ");
-                    // Serial.println(HTTP_req.lastIndexOf("favicon"));
-
-                    // Serial.print("indexOf /favicon.ico: ");
-                    // Serial.print("indexOf /favicon.ico: ");
-                    // Serial.println(HTTP_req.indexOf("/favicon.ico"));
-                    // Serial.print("lastIndexOf of /favicon.ico: ");
-
-                    // HTTP_req = "GET /favicon.ico HTTP";
-                    // Serial.print("Changing HTTP_req to: ");
-                    // Serial.println(HTTP_req);
-
-                    // Serial.print("indexOf favicon: ");
-                    // Serial.println(HTTP_req.indexOf("favicon"));
-                    // Serial.print("lastIndexOf of favicon: ");
-                    // Serial.println(HTTP_req.lastIndexOf("favicon"));
-
-                    // Serial.print("indexOf /favicon.ico: ");
-                    // Serial.print("indexOf /favicon.ico: ");
-                    // Serial.println(HTTP_req.indexOf("/favicon.ico"));
-                    // Serial.print("lastIndexOf of /favicon.ico: ");
-
-                    // HTTP_req = "GET / HTTP";
-                    // Serial.print("Changing HTTP_req to: ");
-                    // Serial.println(HTTP_req);
-
-                    // Serial.print("indexOf favicon: ");
-                    // Serial.println(HTTP_req.indexOf("favicon"));
-                    // Serial.print("lastIndexOf of favicon: ");
-                    // Serial.println(HTTP_req.lastIndexOf("favicon"));
-
-                    // Serial.print("indexOf /favicon.ico: ");
-                    // Serial.print("indexOf /favicon.ico: ");
-                    // Serial.println(HTTP_req.indexOf("/favicon.ico"));
-                    // Serial.print("lastIndexOf of /favicon.ico: ");
-
-                    // Serial.println(HTTP_req.lastIndexOf("/favicon.ico"));
-                    // Serial.println("-----------Done checking icon.");
-                    if (HTTP_req.lastIndexOf("favicon") > -1) {
-                        Serial.print("client requested favicon. Index is:");
-                    // }
-                        client.println("HTTP/1.0 404 <CRLF>");
-                        client.println("<CRLF>");
+                // DSERIAL("+");
+                // if (c == '\n') {
+                //     DSERIALln("\\n");
+                // } else if (c == '\r') {
+                //     DSERIALln("\\r");
+                // } else if (c == '\0') {
+                //     DSERIALln("\\0");
+                // } else {
+                //     DSERIALln(c);
+                // }
+                // while (!parseRequest(c, HTTP_req, maxlength, text_c_str, color, userProvidedData)) {}
+                char* text_c_str = NULL;
+                unsigned char requestType = 0;
+                // if (false) {
+                if (parseRequest(c, text_c_str, color, userProvidedData, requestType)) {
+                    DSERIALln("parsed the whole request");
+                    if (requestType == REQUESTED_FAVICON) {
+                        DSERIALln("favicon");
+                        client.println(F("HTTP/1.0 404 <CRLF>\r\n<CRLF>\r\n\r\n"));
+                        // client.println("<CRLF>");
+                        delay(10); // give the web browser time to receive the data
+                        client.stop();
+                        DSERIALln("answered the HTTP request");
                     } else {
-                    // if (true) {
-                        Serial.println("client requested/answered the form");
-                        // read the color, if given
-                        if (HTTP_req.indexOf("COLR=") > -1) {
-                            Serial.println("client provided COLR");
-                            currentIndex = HTTP_req.indexOf("COLR=")+5;
+                        DSERIALln("not the favicon");
+                        String errorMessage = String();
+                        if (requestType == REQUESTED_GET && userProvidedData) {
+                            DSERIALln("requestType == REQUESTED_GET && userProvidedData");
+                            // DSERIAL("text_c_str: ");DSERIALln(text_c_str);
+                            // DSERIAL("text_c_str == NULL : ");DSERIALln(text_c_str == NULL ? "true" : "false");
+                            // text = String(text_c_str);
+                            // DSERIAL("text: ");DSERIALln(text);
+                            // DSERIAL("color: ");DSERIAL(color.r); DSERIAL(" ");DSERIAL(color.g); DSERIAL(" ");DSERIAL(color.g); DSERIALln(" ");
+                            // text = String(text_c_str);
 
-                            // TODO: proof the next 5 lines
-                            if(HTTP_req.indexOf("&",currentIndex)>-1) {
-                                nextIndex = HTTP_req.indexOf("&",currentIndex);
-                            } else {
-                                nextIndex = HTTP_req.indexOf("HTTP",currentIndex);
+                            const int newTextLength = strlen(text_c_str);
+                            // text = String("aba");
+                            text = String("");
+                            for (int i = 0; i < newTextLength; ++i) {
+                                text += text_c_str[i];
                             }
-
-                            userProvidedData = true;
-                            colorHexadecimal ="#" + (HTTP_req.substring(currentIndex,nextIndex)).substring(3);
-                            color = Kawako::Color(
-                                (unhex(colorHexadecimal[1]) << 4) + unhex(colorHexadecimal[2]),
-                                (unhex(colorHexadecimal[3]) << 4) + unhex(colorHexadecimal[4]),
-                                (unhex(colorHexadecimal[5]) << 4) + unhex(colorHexadecimal[6])
-                            );
+                        } else if (requestType != REQUESTED_SLASH) {
+                            DSERIALln("requestType != REQUESTED_SLASH");
                         }
+                        // DSERIAL("userProvidedData: "); DSERIALln(userProvidedData?"true":"false");
+                        // DSERIAL("text: "); DSERIALln(text_c_str);
+                        // DSERIAL("text: "); DSERIALln(text);
 
-                        // read the text
-                        if (HTTP_req.indexOf("TEXT=")>-1) {
-                            Serial.println("client provided TEXT");
-                            currentIndex = HTTP_req.indexOf("TEXT=")+5;
-                            nextIndex = HTTP_req.indexOf("HTTP",currentIndex)-1;
-                            text = HTTP_req.substring(currentIndex,nextIndex);
-                            text = urldecode(text);
-                            userProvidedData = true;
-                            // TODO:control characters
+                            DSERIAL("text_c_str == NULL : ");DSERIALln(text_c_str == NULL ? "true" : "false");
+                            DSERIAL("text: "); DSERIALln(text_c_str);
+                            DSERIAL("text: ");DSERIALln(text);
+                            DSERIAL("color: ");DSERIAL(color.r); DSERIAL(" ");DSERIAL(color.g); DSERIAL(" ");DSERIAL(color.g); DSERIALln(" ");
+                        switch (requestType) {
+                            case REQUESTED_ERROR_MISSING_TEXT:
+                                errorMessage = F("REQUESTED_ERROR_MISSING_TEXT");
+                                DSERIAL("errorMessage: "); DSERIALln("REQUESTED_ERROR_MISSING_TEXT");
+                                break;
+                            case REQUESTED_ERROR_MISSING_COLOR:
+                                errorMessage = F("REQUESTED_ERROR_MISSING_COLOR");
+                                DSERIAL("errorMessage: "); DSERIALln("REQUESTED_ERROR_MISSING_COLOR");
+                                break;
+                            case REQUESTED_ERROR_MISSING_END_TEXT:
+                                errorMessage = F("REQUESTED_ERROR_MISSING_END_TEXT");
+                                DSERIAL("errorMessage: "); DSERIALln("REQUESTED_ERROR_MISSING_END_TEXT");
+                                break;
+                            case REQUESTED_SLASH:
+                                errorMessage = F("Please enter a text and a color");
+                                DSERIAL("errorMessage: "); DSERIALln("REQUESTED_SLASH");
+                                break;
+                            case REQUESTED_GET:
+                                errorMessage = F("Updated text.");
+                                DSERIAL("errorMessage: "); DSERIALln("REQUESTED_GET");
+                                break;
                         }
-
+                        DSERIAL("errorMessage: "); DSERIALln(errorMessage);
+                        // TODO: handle errors
                         // answer the request
                         // send a standard http response header
-                        client.println("HTTP/1.1 200 OK");
-                        client.println("Content-Type: text/html");
-                        client.println("Connection: close");
+                        client.println(F("HTTP/1.1 200 OK"));
+                        client.println(F("Content-Type: text/html"));
+                        client.println(F("Connection: close"));
                         client.println();
                         // send web page
-                        client.println("<!DOCTYPE html>");
-                        client.println("<html>");
-                        client.println("<head>");
-                        client.println("<title>Welcome to Kawako</title>");
-                        client.println("</head>");
-                        client.println("<body>");
-                        client.println("<h1>Controller Interface</h1>");
+                        client.println(F("<!DOCTYPE html>"));
+                        client.println(F("<html>"));
+                        client.println(F("<head>"));
+                        client.println(F("<title>Welcome to Kawaco</title>"));
+                        client.println(F("</head>"));
+                        client.println(F("<body>"));
+                        client.println(F("<h1>Controller Interface</h1>"));
+                        client.print(F("<h2>")); client.print(errorMessage); client.print(F("</h2>"));
+                        client.println(F("<form method=\"get\">"));
+                        // client.print  ("<div style='padding:10px'><input type=\"color\" name=\"COLR\" value=");client.print(colorHexadecimal);client.println(">CRGB</div>");
+                        client.print  (F("<div style='padding:10px'><input type=\"color\" name=\"COLR\" value=#FF0000>CRGB</div>"));
+                        client.println(F("<div style='padding:10px'><input maxlength=\"30\" type=\"textarea\" size=\"32\" name=\"TEXT\" value="">Enter a text (if longer as 10 characters, it will move around).</div>"));
+                        client.println(F("<div style='padding:10px'><input type=\"submit\" value=\"Submit\"></div>"));
+                        client.println(F("</form>"));
 
-                        client.println("<form method=\"get\">");
-                        client.print  ("<div style='padding:10px'><input type=\"color\" name=\"COLR\" value=");client.print(colorHexadecimal);client.println(">Color</div>");
-                        client.println("<div style='padding:10px'><input maxlength=\"30\" type=\"textarea\" size=\"32\" name=\"TEXT\" value="">Entrer un texte a afficher, si il fait plus de 10 cracteres il sera defilant.</div>");
-                        client.println("<div style='padding:10px'><input type=\"submit\" value=\"Submit\"></div>");
-                        client.println("</form>");
+                        client.println(F("</body>"));
+                        client.println(F("</html>"));
 
-                        // client.println("<form method=\"get\">");
-                        // client.println("<div style='padding:10px'><input type=\"submit\" value=\"Clear\"></div>");
-                        // client.println("<div style='padding:10px'><input type=\"hidden\" name=\"COLR\" value=");client.println(colorHexadecimal);client.println("></div>");
-                        // client.println("<div style='padding:10px'><input maxlength=\"20\" type=\"hidden\" name=\"TEXT\" value=""></div>");
-                        // client.println("</form>");
-
-                        client.println("</body>");
-                        client.println("</html>");
+                        delay(10); // give the web browser time to receive the data
+                        client.stop();
+                        DSERIALln("answered the HTTP request");
                     }
-
-                    HTTP_req = "";
-                    delay(10); // give the web browser time to receive the data
-                    client.stop();
-                    Serial.println("answered the request");
-                    Serial.println("-------------------");
-                    break; // TODO: replace this
-                }
-                // every line of text received from the client ends with \r\n
-                if (c == '\n') {
-                    // last character on line of received text
-                    // starting new line with next character read
-                    currentLineIsBlank = true;
-                } else if (c != '\r') {
-                    // a text character was received from client
-                    currentLineIsBlank = false;
+                } else {
+                    // DSERIALln(".");
                 }
             }
         }
     }
-
+    DSERIAL("checkNewTextHTTP, userProvidedData: "); DSERIALln(userProvidedData? "true":"false");
     return userProvidedData;
 }
 
 // debug function. BUG: if the main loop goes to fast, it will crop the text.
 // For example: "je suis la" => Found a \n at 3
-bool checkNewTextSerial(String &text,
-                        Kawako::Color &color) {
+bool checkNewTextSerial(String &text, CRGB &color) {
     static String buffer = "";
     Serial.setTimeout(1);
     buffer += Serial.readString(); // TODO: set timeout
     short indexOfNewLine = buffer.indexOf('\n');
     // In case we did not receive the full text yet
     if (indexOfNewLine < 0) {
-        // Serial.println("No \\n found");
+        // DSERIALln("No \\n found");
         return false;
     } else {
         short length = buffer.length();
         text = buffer.substring(0, indexOfNewLine);
         buffer.remove(0, length);
-        Serial.println("---");
-        Serial.print("Found a \\n at ");
-        Serial.println(length);
-        Serial.print("New buffer: ");
-        Serial.println(buffer);
+        DSERIALln("---");
+        DSERIAL("Found a \\n at ");
+        DSERIALln(length);
+        DSERIAL("New buffer: ");
+        DSERIALln(buffer);
         color.r = 255;
         color.g = 255;
         color.b = 255;
@@ -270,24 +414,27 @@ bool checkNewTextSerial(String &text,
     }
 }
 
-bool displayOnLEDs(const String &newText, const bool &startAnew,
-                   const Kawako::Color &color) {
-    const unsigned fontSize = 2;
-    const unsigned charWidth = 6;
+bool displayOnLEDs(const String &newText, const bool &startAnew, const CRGB &color) {
+    const unsigned short fontSize = 2;
+    const unsigned short charWidth = 6;
+
     static short textWidth = 0;
     static String currentText = "";
     static short startingPositionOfText = Kawako::leds.width();
 
     // initialize variables to restart animation (with a new text)
     if (startAnew || !currentText.equals(newText)) {
+        DSERIAL("DISPLAYING NEW newText: "); DSERIALln(newText);
         currentText = newText;
+        DSERIAL("DISPLAYING NEW currentText: "); DSERIALln(currentText);
         textWidth = currentText.length() * fontSize * charWidth;
 
         startingPositionOfText = Kawako::leds.width();
         Kawako::leds.setTextWrap(false);// will not create a new line, but move the text instead
         Kawako::leds.setBrightness(80);
         Kawako::leds.setTextSize(fontSize);
-        Kawako::leds.setTextColor(Kawako::leds.Color(color.r, color.g, color.b));
+        Kawako::leds.setTextColor(Kawako::leds.Color(color.r, color.g, color.b)); // TODO: use the color provided
+        // Kawako::leds.setTextColor(Kawako::leds.Color(150, 150, 150)); // TODO: use the color provided
     }
 
     // compute the position of the text
@@ -300,7 +447,13 @@ bool displayOnLEDs(const String &newText, const bool &startAnew,
         }
     }
 
+    DSERIAL("Still displaying currentText: "); DSERIAL(currentText); DSERIAL(" at: "); DSERIALln(startingPositionOfText);
     // display the animation
+    // Kawako::leds.setTextColor(Kawako::leds.Color(150, 150, 150)); // TODO: use the color provided
+    Kawako::leds.setTextColor(Kawako::leds.Color(color.r, color.g, color.b)); // TODO: use the color provided
+    Kawako::leds.setTextWrap(false);// will not create a new line, but move the text instead
+    Kawako::leds.setBrightness(80);
+    Kawako::leds.setTextSize(fontSize);
     Kawako::leds.fillScreen(0);
     Kawako::leds.setCursor(startingPositionOfText, 0);
     Kawako::leds.print(currentText);
@@ -309,57 +462,4 @@ bool displayOnLEDs(const String &newText, const bool &startAnew,
 
 
 //############################################################################# Fonctions #################################################################################
-
-// Given hexadecimal character [0-9,a-f], return decimal value (0 if invalid)
-uint8_t unhex(char c) {
-    return ((c >= '0') && (c <= '9')) ?      c - '0' :
-    ((c >= 'a') && (c <= 'f')) ? 10 + c - 'a' :
-    ((c >= 'A') && (c <= 'F')) ? 10 + c - 'A' : 0;
-}
-
-
-
-String urldecode(String str)
-{
-
-    String encodedString="";
-    char c;
-    char code0;
-    char code1;
-    for (int i =0; i < str.length(); i++){
-        c=str.charAt(i);
-        if (c == '+'){
-            encodedString+=' ';
-        }else if (c == '%') {
-            i++;
-            code0=str.charAt(i);
-            i++;
-            code1=str.charAt(i);
-            c = (h2int(code0) << 4) | h2int(code1);
-            encodedString+=c;
-        } else{
-
-            encodedString+=c;
-        }
-
-        yield();
-    }
-
-    return encodedString;
-}
-
-
-unsigned char h2int(char c)
-{
-    if (c >= '0' && c <='9'){
-        return((unsigned char)c - '0');
-    }
-    if (c >= 'a' && c <='f'){
-        return((unsigned char)c - 'a' + 10);
-    }
-    if (c >= 'A' && c <='F'){
-        return((unsigned char)c - 'A' + 10);
-    }
-    return(0);
-}
 
